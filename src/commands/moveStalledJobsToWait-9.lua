@@ -19,6 +19,7 @@
 
     Events:
       'stalled' with stalled job id.
+      'stalled' with 'missing' field when job hash doesn't exist (fixes #3929).
 ]]
 local rcall = redis.call
 
@@ -72,39 +73,50 @@ if (#stalling > 0) then
                 local removed = rcall("LREM", activeKey, 1, jobId)
 
                 if (removed > 0) then
-                    -- If this job has been stalled too many times, such as if it crashes the worker, then fail it.
-                    local stalledCount = rcall("HINCRBY", jobKey, "stc", 1)
+                    -- Defensive check: verify job hash exists before processing
+                    -- Fixes issue #3929: handle case where job hash was deleted by retention policies
+                    local jobExists = rcall("EXISTS", jobKey)
                     
-                    -- Check if this is a repeatable job by looking at job options
-                    local jobSchedulerId = rcall("HGET", jobKey, "rjk")
-                    local isRepeatableJob = false
-                    if jobSchedulerId then
-                        local schedulerKey = repeatKey .. ":" .. jobSchedulerId
+                    if jobExists == 1 then
+                        -- If this job has been stalled too many times, such as if it crashes the worker, then fail it.
+                        local stalledCount = rcall("HINCRBY", jobKey, "stc", 1)
+                        
+                        -- Check if this is a repeatable job by looking at job options
+                        local jobSchedulerId = rcall("HGET", jobKey, "rjk")
+                        local isRepeatableJob = false
+                        if jobSchedulerId then
+                            local schedulerKey = repeatKey .. ":" .. jobSchedulerId
 
-                        if rcall("EXISTS", schedulerKey) == 1 then
-                            isRepeatableJob = true
-                        else
-                            -- TODO: remove this check in v6, as it is only needed for legacy repeatable jobs
-                            -- that stored the scheduler id in the job key but did not create the scheduler hash key
-                            local prevMillis = rcall("ZSCORE", repeatKey, jobSchedulerId)
-                            if prevMillis then
+                            if rcall("EXISTS", schedulerKey) == 1 then
                                 isRepeatableJob = true
+                            else
+                                -- TODO: remove this check in v6, as it is only needed for legacy repeatable jobs
+                                -- that stored the scheduler id in the job key but did not create the scheduler hash key
+                                local prevMillis = rcall("ZSCORE", repeatKey, jobSchedulerId)
+                                if prevMillis then
+                                    isRepeatableJob = true
+                                end
                             end
                         end
-                    end
-                    
-                    -- Only fail job if it exceeds stall limit AND is not a repeatable job
-                    if stalledCount > maxStalledJobCount and not isRepeatableJob then
-                        local failedReason = "job stalled more than allowable limit"
-                        rcall("HSET", jobKey, "defa", failedReason)
-                    end
-                    
-                    moveJobToWait(metaKey, activeKey, waitKey, pausedKey, markerKey, eventStreamKey, jobId,
-                        "RPUSH")
+                        
+                        -- Only fail job if it exceeds stall limit AND is not a repeatable job
+                        if stalledCount > maxStalledJobCount and not isRepeatableJob then
+                            local failedReason = "job stalled more than allowable limit"
+                            rcall("HSET", jobKey, "defa", failedReason)
+                        end
+                        
+                        moveJobToWait(metaKey, activeKey, waitKey, pausedKey, markerKey, eventStreamKey, jobId,
+                            "RPUSH")
 
-                    -- Emit the stalled event
-                    rcall("XADD", eventStreamKey, "*", "event", "stalled", "jobId", jobId)
-                    table.insert(stalled, jobId)
+                        -- Emit the stalled event
+                        rcall("XADD", eventStreamKey, "*", "event", "stalled", "jobId", jobId)
+                        table.insert(stalled, jobId)
+                    else
+                        -- Job hash doesn't exist (deleted by retention policies)
+                        -- Still track as stalled for observability
+                        rcall("XADD", eventStreamKey, "*", "event", "stalled", "jobId", jobId, "missing", "1")
+                        table.insert(stalled, jobId)
+                    end
                 end
             end
         end
